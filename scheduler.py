@@ -1,12 +1,12 @@
 import asyncio, os, pytz
-from datetime import datetime, date, timezone
-from sched import scheduler
+from datetime import datetime, date, time
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, delete
+from sqlalchemy.orm import selectinload
 from db import async_session
 from models import Holiday, User, Notification
-from bot import bot
+from bot import bot, _format_holiday_name, t
 
 load_dotenv()
 
@@ -17,18 +17,12 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", 50))
 
 
 async def send_notification(user, text):
-    tasks = []
-
-    #Telegram
     if getattr(user, "tg_id", None):
-        tasks.append(bot.send_message(user.tg_id, text))
+        try:
+            await bot.send_message(user.tg_id, text)
+        except Exception:
+            pass
 
-    #ВEmail, Push, SMS:
-    #if getattr(user, "email", None):
-    #    tasks.append(send_email(user.email, text))
-
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
 
 async def send_holiday_notifications():
     tz = pytz.timezone(TIMEZONE)
@@ -38,10 +32,11 @@ async def send_holiday_notifications():
 
     today = date.today()
     async with async_session() as session:
+        # Подгружаем переводы вместе с праздниками (EAGER LOADING)
         holidays_result = await session.execute(
-            select(Holiday).where(
-                and_(Holiday.day == today.day, Holiday.month == today.month)
-            )
+            select(Holiday)
+            .options(selectinload(Holiday.translations))
+            .where(and_(Holiday.day == today.day, Holiday.month == today.month))
         )
         holidays = holidays_result.scalars().all()
         if not holidays:
@@ -67,72 +62,88 @@ async def send_holiday_notifications():
                 if not batch:
                     break
 
-                tasks = [send_notification(user, f"🎉 Поздравляем с праздником: {holiday.name}!") for user in batch]
+                tasks = []
+                for user in batch:
+                    holiday_name = _format_holiday_name(holiday, user.lang)
+                    tasks.append(send_notification(user, f"🎉 {holiday_name}!"))
                 if tasks:
                     await asyncio.gather(*tasks)
                     await asyncio.sleep(0.3)
 
-                notifications_to_add = [Notification(user_id=user.id, holiday_id=holiday.id) for user in batch]
-                session.add_all(notifications_to_add)
+                session.add_all([
+                    Notification(user_id=user.id, holiday_id=holiday.id)
+                    for user in batch
+                ])
                 await session.commit()
-
                 last_id = batch[-1].id
 
-
-async def send_birthday_notifications():
-    tz = pytz.timezone(TIMEZONE)
-    now = datetime.now(tz)
-    if not (SEND_HOUR_START <= now.hour < SEND_HOUR_END):
-        return
-
-    today_str = date.today().strftime("%m-%d")
+async def check_birthdays():
+    today = date.today()
 
     async with async_session() as session:
-        last_id = 0
-        while True:
-            result = await session.execute(
-                select(User)
-                .outerjoin(
-                    Notification,
-                    and_(
-                        User.id == Notification.user_id,
-                        Notification.holiday_id == None
+        # 1. Получаем id специального праздника "birthday"
+        q = await session.execute(
+            select(Holiday).where(Holiday.type == "birthday")
+        )
+        birthday_holiday = q.scalar_one()
+
+        # 2. Чистим уведомления для тех, у кого дата рождения стерта
+        # (например, пользователь очистил свой ДР)
+        await session.execute(
+            delete(Notification).where(
+                Notification.holiday_id == birthday_holiday.id,
+                Notification.user_id.in_(
+                    select(User.id).where(User.birthday.is_(None))
+                )
+            )
+        )
+        await session.commit()
+
+        # 3. Ищем всех пользователей, у кого совпадает день и месяц
+        q = await session.execute(
+            select(User).where(User.birthday.isnot(None))
+        )
+        users = q.scalars().all()
+
+        for user in users:
+            if (
+                user.birthday
+                and user.birthday.day == today.day
+                and user.birthday.month == today.month
+            ):
+                # 4. Проверяем — было ли уже уведомление сегодня
+                qn = await session.execute(
+                    select(Notification).where(
+                        Notification.user_id == user.id,
+                        Notification.holiday_id == birthday_holiday.id,
+                        Notification.sent_at >= datetime.combine(today, time.min),
                     )
                 )
-                .where(User.birthday.isnot(None), Notification.id == None, User.id > last_id)
-                .order_by(User.id)
-                .limit(BATCH_SIZE)
-            )
-            batch = result.scalars().all()
-            if not batch:
-                break
+                exists = qn.first()
+                if exists:
+                    continue  # уже было сегодня
 
-            tasks = []
-            notifications_to_add = []
-
-            for user in batch:
-                if user.birthday.strftime("%m-%d") != today_str:
+                # 5. Отправляем сообщение
+                text = t("birthday_notifications", user.lang, user=user)
+                try:
+                    await bot.send_message(user.tg_id, text)
+                except Exception as e:
+                    print(f"Ошибка отправки ДР пользователя {user.id}: {e}")
                     continue
 
-                tasks.append(send_notification(user, f"🎂 С Днём рождения, {user.name}! 🎉"))
-                notifications_to_add.append(Notification(user_id=user.id, holiday_id=None))
+                # 6. Записываем новое уведомление
+                notif = Notification(
+                    user_id=user.id,
+                    holiday_id=birthday_holiday.id,
+                    sent_at=datetime.now(),
+                )
+                session.add(notif)
 
-            if tasks:
-                await asyncio.gather(*tasks)
-                await asyncio.sleep(0.3)
-
-            if notifications_to_add:
-                session.add_all(notifications_to_add)
-                await session.commit()
-
-            if batch:
-                last_id = batch[-1].id
-            else:
-                break
+        await session.commit()
 
 def start_scheduler():
-    schedular = AsyncIOScheduler(timezone=TIMEZONE)
-    schedular.add_job(send_holiday_notifications, "cron", minute="*")
-    schedular.add_job(send_birthday_notifications, "cron", minute="*")
-    schedular.start()
+    scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+    scheduler.add_job(send_holiday_notifications, "cron", minute="*")
+    scheduler.add_job(check_birthdays, "cron", minute="*")
+    scheduler.start()
     print("Scheduler started!")
